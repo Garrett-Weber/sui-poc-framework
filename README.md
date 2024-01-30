@@ -14,7 +14,7 @@ You can install the SUI POC Framework by adding the following line to your Cargo
 
 ```
 [dependencies]
-sui-poc-framework = "0.1.0"
+sui-poc-framework = { git = "https://github.com/Garrett-Weber/sui-poc-framework" }
 ```
 
 ## Usage
