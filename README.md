@@ -43,3 +43,5 @@ if bal_after > bal_before {
 ```
 
 # License
+
+This project is licensed under the terms of the MIT License.
