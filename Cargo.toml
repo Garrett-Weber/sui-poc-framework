@@ -1,6 +1,6 @@
 [package]
 name = "sui-poc-framework"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Garrett Weber <garrettbenweber@gmail.com>"]
 repository = "https://github.com/Garrett-Weber/sui-poc-framework"
@@ -28,4 +28,5 @@ simulacrum = { git = "https://github.com/MystenLabs/sui", rev = "devnet-v1.17.0"
 [dev-dependencies]
 bcs = "0.1.4"
 serde = { version = "1.0.144", features = ["derive"] }
+lazy_static = "1.4.0"
 shared-crypto = { git = "https://github.com/MystenLabs/sui", rev = "devnet-v1.17.0" }

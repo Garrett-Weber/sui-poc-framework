@@ -11,14 +11,17 @@ use sui_protocol_config::ProtocolConfig;
 use sui_sdk::{rpc_types::SuiObjectDataOptions, SuiClient};
 use sui_swarm_config::network_config_builder::ConfigBuilder;
 use sui_types::{
-    base_types::{ObjectID, SuiAddress},
+    base_types::{ObjectID, SequenceNumber, SuiAddress},
     coin::Coin,
-    crypto::{AccountKeyPair, KeypairTraits, SuiKeyPair},
+    crypto::{AccountKeyPair, AuthorityQuorumSignInfo, KeypairTraits, SuiKeyPair},
     digests::TransactionDigest,
     effects::TransactionEffects,
     error::ExecutionError,
     gas_coin::{self, MIST_PER_SUI},
+    message_envelope::VerifiedEnvelope,
+    messages_checkpoint::CheckpointSummary,
     object::Object,
+    sui_system_state::epoch_start_sui_system_state::EpochStartSystemState,
 };
 
 pub struct Environment<R = ThreadRng> {
@@ -42,7 +45,6 @@ impl<R: AllowedRng + Clone> Environment<R> {
     pub fn random_keypair(&mut self) -> AccountKeyPair {
         sui_types::crypto::get_key_pair_from_rng(self.sim.rng()).1
     }
-
 }
 
 impl<R> Environment<R> {
@@ -111,6 +113,18 @@ impl<R> Environment<R> {
         Ok(self.sim.store().backing_store().get_object(object_id)?)
     }
 
+    pub fn get_object_with_sequence(
+        &self,
+        object_id: &ObjectID,
+        sequence_number: SequenceNumber,
+    ) -> anyhow::Result<Option<Object>> {
+        Ok(self
+            .sim
+            .store()
+            .backing_store()
+            .get_object_by_key(object_id, sequence_number)?)
+    }
+
     /// Get all objects owned by an address.
     pub fn get_owned_objects(&self, owner: sui_types::base_types::SuiAddress) -> Vec<Object> {
         self.sim.store().owned_objects(owner).collect::<Vec<_>>()
@@ -163,12 +177,75 @@ impl<R> Environment<R> {
         }
     }
 
+    /// Get Epoch
+    pub fn get_epoch(&self) -> &EpochStartSystemState {
+        self.sim.epoch_start_state()
+    }
+
     /// Execute transaction in simulator
     pub fn execute_transaction(
         &mut self,
         transaction: sui_types::transaction::Transaction,
     ) -> anyhow::Result<(TransactionEffects, Option<ExecutionError>)> {
         self.sim.execute_transaction(transaction)
+    }
+
+    /// Execute transaction in simulator and print debug info
+    pub fn execute_transaction_debug(
+        &mut self,
+        transaction: sui_types::transaction::Transaction,
+    ) -> anyhow::Result<(TransactionEffects, Option<ExecutionError>)> {
+        let (effects, error) = self.sim.execute_transaction(transaction)?;
+        println!(
+            "Transaction Effects Summary: {:?}",
+            effects.summary_for_debug()
+        );
+
+        let changed_objects = effects.all_changed_objects();
+        println!("Changed Objects: {}", changed_objects.len());
+        for (obj_ref, owner, change_kind) in changed_objects {
+            println!(
+                "Object: {:?}, Owner: {:?}, Change Kind: {:?}",
+                obj_ref, owner, change_kind
+            );
+        }
+
+        let deleted_objects = effects.all_removed_objects();
+        println!("Deleted Objects: {}", deleted_objects.len());
+        for (obj_ref, _remove_kind) in deleted_objects {
+            println!("Object: {:?}", obj_ref);
+        }
+        Ok((effects, error))
+    }
+
+    /// Advance simulator clock by given duration.
+    ///
+    /// This creates and executes a ConsensusCommitPrologue transaction which advances the chain Clock by the provided duration.
+    pub fn advance_clock(&mut self, duration: std::time::Duration) -> TransactionEffects {
+        self.sim.advance_clock(duration)
+    }
+
+    /// Creates the next Checkpoint using the Transactions enqueued since the last checkpoint was created.
+    pub fn create_checkpoint(
+        &mut self,
+    ) -> VerifiedEnvelope<CheckpointSummary, AuthorityQuorumSignInfo<true>> {
+        self.sim.create_checkpoint()
+    }
+
+    /// Advances the epoch.
+    ///
+    /// This creates and executes an EndOfEpoch transaction which advances the chain into the next
+    /// epoch. Since it is required to be the final transaction in an epoch, the final checkpoint in
+    /// the epoch is also created.
+    ///
+    /// create_random_state controls whether a `RandomStateCreate` end of epoch transaction is
+    /// included as part of this epoch change (to initialise on-chain randomness for the first
+    /// time).
+    ///
+    /// NOTE: This function does not currently support updating the protocol version or the system
+    /// packages
+    pub fn advance_epoch(&mut self, create_random_state: bool) {
+        self.sim.advance_epoch(create_random_state)
     }
 }
 
@@ -208,6 +285,11 @@ impl<R: AllowedRng + Clone> EnvironmentBuilder<R> {
 
     pub fn set_start_time(&mut self, start_time: u64) -> &mut Self {
         self.start_time_ms = start_time;
+        self
+    }
+
+    pub fn set_start_epoch(&mut self, start_epoch: u64) -> &mut Self {
+        self.start_time_ms = start_epoch * 1000;
         self
     }
 
@@ -324,8 +406,8 @@ impl<R: AllowedRng + Clone> EnvironmentBuilder<R> {
             objects.extend(
                 response
                     .data
-                    .iter()
-                    .filter_map(|o| o.data.clone())
+                    .into_iter()
+                    .filter_map(|o| o.data)
                     .map(|o| EnvironmentBuilder::object_data_to_object(o))
                     .filter(|o| o.is_ok())
                     .map(|o| o.unwrap()),
@@ -350,20 +432,19 @@ impl<R: AllowedRng + Clone> EnvironmentBuilder<R> {
             .build();
         let mut store = simulacrum::InMemoryStore::new(&network_config.genesis);
 
-        store.update_objects(self.objects.clone(), vec![]);
+        store.update_objects(self.objects.to_owned(), vec![]);
 
         for key in keys.iter() {
             self.fund_key(SuiAddress::from(key.public()));
         }
 
-        Environment {
-            keys,
-            sim: Simulacrum::<R>::new_with_network_config_store(
-                &network_config,
-                self.rng.to_owned(),
-                store,
-            ),
-        }
+        let sim = Simulacrum::<R>::new_with_network_config_store(
+            &network_config,
+            self.rng.to_owned(),
+            store,
+        );
+
+        Environment { keys, sim }
     }
 }
 
@@ -411,25 +492,32 @@ impl EnvironmentBuilder {
 
 #[cfg(test)]
 mod tests {
-    use rand::{rngs::OsRng, Rng};
+    use rand::{rngs::OsRng, Rng, SeedableRng};
     use shared_crypto::intent::Intent;
     use std::str::FromStr;
+    use std::sync::Mutex;
     use sui_keys::keystore::AccountKeystore;
     use sui_move_build::BuildConfig;
     use sui_sdk::SuiClientBuilder;
     use sui_types::{
         base_types::SuiAddress,
+        clock::Clock,
         gas_coin::MIST_PER_SUI,
         id::UID,
         is_system_package,
         programmable_transaction_builder::ProgrammableTransactionBuilder,
         signature::GenericSignature,
         storage::WriteKind,
+        sui_system_state::epoch_start_sui_system_state::EpochStartSystemStateTrait as _,
         transaction::{CallArg, ObjectArg, SenderSignedData, TransactionData},
         Identifier,
     };
 
     use super::*;
+
+    lazy_static::lazy_static! {
+        static ref PUBLISH_MUTEX: Mutex<()> = Mutex::new(());
+    }
 
     #[test]
     fn build_env() {
@@ -494,7 +582,7 @@ mod tests {
         let rpc_client = rt
             .block_on(SuiClientBuilder::default().build_devnet())
             .unwrap();
-        let address = "0x0000000000000000000000000000000000000000000000000000000000000008"; // 0x2::Random::Random
+        let address = "0x0000000000000000000000000000000000000000000000000000000000000005"; // 0x5 SystemState
         let address = move_core_types::account_address::AccountAddress::from_str(address).unwrap();
         let object_id = ObjectID::from_address(address);
 
@@ -517,7 +605,7 @@ mod tests {
         let rpc_client = rt
             .block_on(SuiClientBuilder::default().build_devnet())
             .unwrap();
-        let address = "0x49b128c9313e08490ead9d9ef5aeb02b9180d03a437c17c4361a63cf087dbc81"; // Counter package
+        let address = "0x0000000000000000000000000000000000000000000000000000000000000003"; // SUI Consensus
         let address = move_core_types::account_address::AccountAddress::from_str(address).unwrap();
         let object_id = ObjectID::from_address(address);
 
@@ -582,6 +670,7 @@ mod tests {
 
     #[test]
     fn build_env_with_published_package() {
+        let _mutex = PUBLISH_MUTEX.lock().unwrap();
         let path = "tests/basics/";
         let env = Environment::builder()
             .publish_package(path)
@@ -610,8 +699,6 @@ mod tests {
 
     #[test]
     fn deterministic_env() {
-        use rand::SeedableRng;
-
         let det_rng = rand::rngs::StdRng::from_seed([0; 32]);
 
         let mut env_a = Environment::builder_with_rng(det_rng.clone()).build();
@@ -736,6 +823,7 @@ mod tests {
         );
     }
 
+    #[ignore = "Devnet resets break this test"]
     #[test]
     fn interact_with_cloned_counter() {
         #[derive(Debug, serde::Deserialize)]
@@ -903,6 +991,8 @@ mod tests {
             value: u64,
         }
 
+        let _mutex = PUBLISH_MUTEX.lock().unwrap();
+
         let path = "tests/basics/";
         let counter_value = 15u64;
         let counter_id = ObjectID::from_str("0x31337").unwrap();
@@ -1040,5 +1130,146 @@ mod tests {
         let counter: Counter = counter_obj.to_rust().unwrap();
 
         assert_eq!(counter.value, counter_value, "Counter value is incorrect");
+    }
+
+    #[test]
+    fn get_object_with_sequence_number() {
+        let mut env = Environment::builder().build();
+        let keystore = env.key_store().unwrap();
+        let sender_address = keystore.get_address_by_alias("0".to_string()).unwrap();
+        let recv_address = keystore.get_address_by_alias("1".to_string()).unwrap();
+        let sponsor_address = SuiAddress::from(env.funder_keypair().unwrap().public());
+
+        let sponsor_obj = env.get_funder_gas_object().unwrap().unwrap();
+
+        let mut tx_builder = ProgrammableTransactionBuilder::new();
+        tx_builder.transfer_sui(*recv_address, Some(MIST_PER_SUI / 2));
+
+        let ptx = tx_builder.finish();
+
+        let tx_data = TransactionData::new_programmable_allow_sponsor(
+            *sender_address,
+            vec![(
+                sponsor_obj.id(),
+                sponsor_obj.as_inner().version(),
+                sponsor_obj.as_inner().digest(),
+            )],
+            ptx,
+            MIST_PER_SUI,
+            env.sim.reference_gas_price(),
+            sponsor_address,
+        );
+
+        let key_sig = keystore
+            .sign_secure(&sender_address, &tx_data, Intent::sui_transaction())
+            .unwrap();
+
+        let sponsor_sig = keystore
+            .sign_secure(&sponsor_address, &tx_data, Intent::sui_transaction())
+            .unwrap();
+
+        let tx = sui_types::transaction::Transaction::new(SenderSignedData::new(
+            tx_data,
+            Intent::sui_transaction(),
+            vec![
+                GenericSignature::Signature(key_sig),
+                GenericSignature::Signature(sponsor_sig),
+            ],
+        ));
+
+        let tx_res = env.execute_transaction(tx).unwrap();
+
+        let changed_object = tx_res
+            .0
+            .all_changed_objects()
+            .into_iter()
+            .find(|o| o.2 == WriteKind::Mutate)
+            .unwrap()
+            .0;
+
+        let prev_bal = gas_coin::GasCoin::try_from(
+            &env.get_object_with_sequence(
+                &changed_object.0,
+                changed_object.1.one_before().unwrap(),
+            )
+            .unwrap()
+            .unwrap(),
+        )
+        .unwrap()
+        .0
+        .balance;
+
+        let current_bal =
+            gas_coin::GasCoin::try_from(&env.get_object(&changed_object.0).unwrap().unwrap())
+                .unwrap()
+                .0
+                .balance;
+
+        assert!(
+            prev_bal.value() > current_bal.value(),
+            "Object with previous sequence number did not contain correct balance"
+        );
+    }
+
+    #[test]
+    fn advance_env_clock() {
+        let mut env = Environment::builder().build();
+
+        let duration = std::time::Duration::from_millis(1);
+        let effects = env.advance_clock(duration);
+
+        let clock_object_ref = effects.mutated_excluding_gas().pop().unwrap().0;
+
+        let old_timestamp_ms = env
+            .get_object_with_sequence(
+                &clock_object_ref.0,
+                clock_object_ref.1.one_before().unwrap(),
+            )
+            .unwrap()
+            .unwrap()
+            .to_rust::<Clock>()
+            .unwrap()
+            .timestamp_ms;
+
+        let Clock { timestamp_ms, .. } = env
+            .get_object(&clock_object_ref.0)
+            .unwrap()
+            .unwrap()
+            .to_rust()
+            .unwrap();
+
+        assert_eq!(
+            timestamp_ms - old_timestamp_ms,
+            duration.as_millis() as u64,
+            "Clock did not advance by duration"
+        );
+    }
+
+    #[test]
+    fn create_env_checkpoint() {
+        let det_rng = rand::rngs::StdRng::from_seed([0; 32]);
+
+        let mut env = Environment::builder_with_rng(det_rng.clone()).build();
+
+        let digest_a = env.create_checkpoint().digest().clone();
+
+        let mut env = Environment::builder_with_rng(det_rng).build();
+
+        let digest_b = env.create_checkpoint().digest().clone();
+
+        assert_eq!(digest_a, digest_b, "Blank checkpoint digests not equal");
+    }
+
+    #[test]
+    fn advance_env_epoch() {
+        let mut env = Environment::builder().build();
+
+        let epoch_before = env.get_epoch().epoch();
+
+        env.advance_epoch(false);
+
+        let epoch_after = env.get_epoch().epoch();
+
+        assert_eq!(epoch_after - epoch_before, 1, "Epoch did not advance");
     }
 }

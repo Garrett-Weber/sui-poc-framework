@@ -7287,11 +7287,12 @@ dependencies = [
 
 [[package]]
 name = "sui-poc-framework"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bcs",
  "fastcrypto 0.1.7 (git+https://github.com/MystenLabs/fastcrypto?rev=fastcrypto-v0.1.7)",
+ "lazy_static",
  "move-core-types",
  "rand 0.8.5",
  "serde",
